@@ -27,6 +27,7 @@ import jax_extra
 import shardlib.shardops as shardops
 import shardlib.shardtypes as shardtypes
 import training_io
+from flash_attention import attention as flash_attention_fn
 from input_loader import FlatTokensParams, HuggingFaceDataParams, TokenBatch, TokenBatchParams, get_loader
 from jax_extra import explicit_activation_checkpointing, fold_in_str, save_for_backward
 from shardlib.shardtypes import Array, bf16, bool_, f32, make_shardings, pytree_dataclass, u32
@@ -45,6 +46,7 @@ class Hparams:
     vocab: int
     d_ff: int
     rope_max_timescale: int
+    use_flash_attention: bool = False
 
 
 @pytree_dataclass
@@ -139,15 +141,16 @@ class Model:
         x = shardops.psum_scatter("B/d L M -> B/d L M/t", x)
 
         L = ids.shape[1]
-        segment_ids = jnp.cumsum(is_seq_start, axis=1)
-        segment_mask: bool_[b"B/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
-        segment_mask: bool_[b"B/d L L 1 1"] = segment_mask[
-            ..., jnp.newaxis, jnp.newaxis
-        ]  # add axes for q_per_k, num_kv_heads dimensions
-        causal_mask: bool_[b"1 L L 1 1"] = jnp.tril(jnp.ones((L, L), dtype=jnp.bool_), 0)[
-            jnp.newaxis, ..., jnp.newaxis, jnp.newaxis
-        ]
-        causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
+        if not h.use_flash_attention:
+            segment_ids = jnp.cumsum(is_seq_start, axis=1)
+            segment_mask: bool_[b"B/d L L"] = segment_ids[:, :, jnp.newaxis] == segment_ids[:, jnp.newaxis, :]
+            segment_mask: bool_[b"B/d L L 1 1"] = segment_mask[
+                ..., jnp.newaxis, jnp.newaxis
+            ]  # add axes for q_per_k, num_kv_heads dimensions
+            causal_mask: bool_[b"1 L L 1 1"] = jnp.tril(jnp.ones((L, L), dtype=jnp.bool_), 0)[
+                jnp.newaxis, ..., jnp.newaxis, jnp.newaxis
+            ]
+            causal_mask: bool_[b"B/d L L 1 1"] = jnp.logical_and(segment_mask, causal_mask)
 
         rope_table = RopeTable.create(L, h)
 
@@ -169,12 +172,19 @@ class Model:
             k = save_for_backward(k)
             v = save_for_backward(v)
             k = rope_table.apply("L d -> 1 L 1 d", k)
-            logits = shardops.einsum_unreduced(
-                "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
-            )
-            logits = jnp.where(causal_mask, logits, -1e10)
-            probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
-            attn_out = shardops.einsum_unreduced("B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v)
+            if h.use_flash_attention:
+                # Flash attention handles causal masking internally via Pallas kernels.
+                # Note: segment masking for packed sequences is not supported with flash attention.
+                attn_out = flash_attention_fn(jnp.bfloat16(q), jnp.bfloat16(k), jnp.bfloat16(v))
+            else:
+                logits = shardops.einsum_unreduced(
+                    "B/d Qlen Q K/t D, B/d Klen K/t D -> B/d Qlen Klen Q K/t", q, k, preferred_element_type=jnp.float32
+                )
+                logits = jnp.where(causal_mask, logits, -1e10)
+                probs = jnp.bfloat16(jax.nn.softmax(logits, axis=2))
+                attn_out = shardops.einsum_unreduced(
+                    "B/d Qlen Klen Q K/t, B/d Klen K/t D -> B/d Qlen Q K/t D", probs, v
+                )
             w_o = shardops.all_gather("M/d Q K/t D -> M Q K/t D", jnp.bfloat16(layer_weights.w_o))
             attn_out = shardops.einsum_unreduced("B/d Qlen Q K/t D, M Q K/t D -> B/d Qlen M", attn_out, w_o)
             attn_out = shardops.psum_scatter("B/d Qlen M -> B/d Qlen M/t", attn_out)
@@ -423,6 +433,7 @@ class Config:
     io: training_io.IOConfig
     flat_tokens: Optional[FlatTokensParams] = None
     hf_dataset: Optional[HuggingFaceDataParams] = None
+    wandb_project: Optional[str] = None
 
     def __post_init__(self):
         assert self.flat_tokens is not None or self.hf_dataset is not None, (
@@ -437,7 +448,7 @@ class Config:
         return self.flat_tokens or self.hf_dataset
 
 
-def main_contained(config, logger):
+def main_contained(config, logger, wandb_run=None):
     """Main program, which does not access external services except as specified by config.paths or logger."""
     # Use partitionable (and hopefully fusable!) RNG.
     #
@@ -495,7 +506,7 @@ def main_contained(config, logger):
                     f"MFU (projections only): {100 * (2 * 6 * model_params * tokens / (num_devices * profile_duration)) / device_flops:.2f}% MFU"
                 )
 
-            training_io.log(step, logger, output)
+            training_io.log(step, logger, output, wandb_run=wandb_run)
 
 
 @hydra.main(config_path="configs", version_base=None)
@@ -515,7 +526,33 @@ def main(config):
         )
     else:
         logger = None
-    main_contained(config, logger)
+    wandb_run = None
+    if config.wandb_project:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=config.wandb_project,
+            name=config.paths.model_name,
+            config={
+                "model": {
+                    "d_model": config.model.d_model,
+                    "n_q_per_kv": config.model.n_q_per_kv,
+                    "n_kv": config.model.n_kv,
+                    "d_head": config.model.d_head,
+                    "layers": config.model.layers,
+                    "vocab": config.model.vocab,
+                    "d_ff": config.model.d_ff,
+                },
+                "training": {
+                    "learning_rate": config.training.learning_rate,
+                    "warmup_steps": config.training.warmup_steps,
+                    "steps": config.training.steps,
+                    "batch_size": config.training.tokens.batch,
+                    "seq_len": config.training.tokens.len,
+                },
+            },
+        )
+    main_contained(config, logger, wandb_run=wandb_run)
 
 
 if __name__ == "__main__":

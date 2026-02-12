@@ -113,6 +113,27 @@ class DimSpec:
     def __str__(self):
         return "/".join([self.shape] + list(self.sharding))
 
+    def get_per_shard_shape_from_environment(self) -> int:
+        """Looks up the per-shard size of the dimension in the current environment."""
+        try:
+            # try to parse as a literal dimension
+            return int(self.shape)
+        except ValueError:
+            pass
+        # Look up global shape
+        v = _VARS.get()
+        if self.shape not in v:
+            raise TypeCheckError(f"unknown dimension {self.shape}")
+        global_shape = v[self.shape]
+        # Look up sharding
+        axis_env = jax._src.core.thread_local_state.trace_state.axis_env
+        axis_sizes = {axis.name: axis.size for axis in axis_env} if axis_env else {}
+        for axis in self.sharding:
+            if axis not in axis_sizes:
+                raise TypeCheckError(f"unknown axis {axis}")
+            global_shape //= axis_sizes[axis]
+        return global_shape
+
 
 @dataclass
 class ShapeSpec:
@@ -147,6 +168,9 @@ class ShapeSpec:
     def __str__(self):
         return " ".join(str(dim) for dim in self.dims)
 
+    def get_per_shard_shape_from_environment(self) -> Sequence[int]:
+        return [dim.get_per_shard_shape_from_environment() for dim in self.dims]
+
 
 #### Shape checking
 def _partition_spec_equiv(lhs: jax.sharding.PartitionSpec, rhs: jax.sharding.PartitionSpec) -> bool:
@@ -159,8 +183,8 @@ def _partition_spec_equiv(lhs: jax.sharding.PartitionSpec, rhs: jax.sharding.Par
 
 def check(dtype, shape_spec: ShapeSpec, value):
     """Checks that a value has the expected dtype and shape."""
-    if not isinstance(value, jax.Array):
-        raise TypeCheckError("is not a jax.Array")
+    if not isinstance(value, (jax.Array, jax.ShapeDtypeStruct)):
+        raise TypeCheckError("is not a jax.Array or jax.ShapeDtypeStruct")
     if value.dtype != dtype:
         raise TypeCheckError(f"is {value.dtype}, but expected {dtype}")
     shape = value.shape
@@ -186,6 +210,9 @@ def check(dtype, shape_spec: ShapeSpec, value):
         # Check sizes
         for dim, dim_spec in zip(shape, shape_spec.dims):
             check_size(dim_spec.shape, dim)
+
+        if isinstance(value, jax.ShapeDtypeStruct):
+            return
 
         # Check sharding
         expected_spec = shape_spec.partition_spec()

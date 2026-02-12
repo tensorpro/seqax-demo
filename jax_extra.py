@@ -1,5 +1,6 @@
 """Extra utilities for JAX and Python."""
 
+import dataclasses
 import hashlib
 from dataclasses import fields, is_dataclass
 from typing import Union, get_args
@@ -48,6 +49,12 @@ def make_dataclass_from_dict(cls, data):
     field_data = {}
     for field in fields(cls):
         field_value = data.get(field.name)
+        if field_value is None and field.default is not dataclasses.MISSING:
+            field_data[field.name] = field.default
+            continue
+        if field_value is None and field.default_factory is not dataclasses.MISSING:
+            field_data[field.name] = field.default_factory()
+            continue
         if hasattr(field.type, "__origin__") and field.type.__origin__ is Union:
             field_data[field.name] = _handle_union(field.name, field_value, get_args(field.type))
         else:
