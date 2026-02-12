@@ -93,7 +93,9 @@ def load_checkpoint_if_it_exists(checkpoint_dir: str, state: PyTree, config: IOC
                     checkpoint_number = int(os.path.basename(c))
                 except ValueError:
                     continue
-                root = zarr.open_group(zarr.storage.FSStore(c, fs=fs))
+                protocol = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+                zarr_path = c if protocol in ("file", "local", "") else f"{protocol}://{c}"
+                root = zarr.open_group(zarr_path, mode="r")
                 if "write_completed" not in root.attrs:
                     print(f"zarr 'write_completed' marker is missing in checkpoint {c}; skipping.")
                     continue
@@ -173,7 +175,7 @@ def save_zarr(filename: str, state: PyTree, config: IOConfig):
         for path, arr in state:
             path = jax.tree_util.keystr(path)
             chunk_shape = arr.sharding.shard_shape(arr.shape)
-            root.empty(path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
+            root.create_array(name=path, shape=arr.shape, chunks=chunk_shape, dtype=arr.dtype)
     multihost_utils.sync_global_devices("save_zarr_begin")
 
     root = zarr.open_group(filename, mode="r+")

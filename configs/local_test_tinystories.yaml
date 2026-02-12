@@ -1,0 +1,46 @@
+# Train a small language model on TinyStories, right on your laptop!
+#
+# Run on CPU:
+#   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_tinystories +paths.model_name=tinystories_000
+#
+# With Weights & Biases logging:
+#   XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name=local_test_tinystories +paths.model_name=tinystories_000 +wandb_project=seqax
+
+defaults:
+- base
+- _self_
+
+training:
+  warmup_steps: 50
+  steps:        500
+  steps_for_lr: 500
+  learning_rate: 1.0e-3
+  tokens:
+    batch: 8
+    len: 256
+
+model:
+  d_model: 384
+  n_q_per_kv: 1
+  n_kv: 6
+  d_head: 64
+  layers: 6
+  d_ff: 1536
+  vocab: 32000
+  rope_max_timescale: 10000
+
+paths:
+  root_working_dir: '/tmp'
+
+checkpoint_interval: 100
+num_hosts: 1
+
+mesh:
+  d: 4
+  t: 2
+
+hf_dataset:
+  path: roneneldan/TinyStories
+  num_workers: 0
+  tokenizer: NousResearch/Llama-2-7b-hf
+  sequences_packed_per_batch: 32

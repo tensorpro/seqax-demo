@@ -11,3 +11,4 @@ transformers  # For Huggingface data loader
 datasets>=3.0 # For Huggingface data loader
 torch[cpu]    # For Huggingface data loader
 wandb         # Optional: for Weights & Biases logging (enable with wandb_project config)
+jupyter       # For sharding_tutorial.ipynb

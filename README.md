@@ -47,6 +47,14 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m train --config-name
 
 The `paths.model_name` flag specifies which subdirectory on disk (inside `/tmp`) to write model checkpoints to. You'll typically want to change this when starting a new model run.
 
+### Sharding tutorial
+
+There is an interactive tutorial that walks through how sharded and tiled matmuls work. You can run it as a Jupyter notebook or as an IPython script:
+
+```bash
+XLA_FLAGS=--xla_force_host_platform_device_count=8 jupyter notebook sharding_tutorial.ipynb
+```
+
 ### Flash attention
 
 To use flash attention, add `+model.use_flash_attention=true` to your command:
